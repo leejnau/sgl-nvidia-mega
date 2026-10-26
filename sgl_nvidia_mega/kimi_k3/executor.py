@@ -8,11 +8,21 @@ from functools import partial
 from typing import Any
 
 import torch
-from sglang.srt.megakernels.binding import HybridStepView
+
+try:
+    from sglang.srt.kernel_plugins.nvidia.binding import HybridStepView
+except ModuleNotFoundError as error:  # SGLang before sgl-project/sglang#45389
+    if error.name not in (
+        "sglang.srt.kernel_plugins",
+        "sglang.srt.kernel_plugins.nvidia",
+        "sglang.srt.kernel_plugins.nvidia.binding",
+    ):
+        raise
+    from sglang.srt.megakernels.binding import HybridStepView
 
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
-    "srt/megakernels/binding.py": (
+    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "HybridStepView",
         "block_table",
         "kda",

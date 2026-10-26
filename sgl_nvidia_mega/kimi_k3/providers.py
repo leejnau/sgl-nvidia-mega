@@ -24,8 +24,18 @@ import torch
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.megakernels.binding import HybridPoolView
 from sglang.srt.runtime_context import get_parallel
+
+try:
+    from sglang.srt.kernel_plugins.nvidia.binding import HybridPoolView
+except ModuleNotFoundError as error:  # SGLang before sgl-project/sglang#45389
+    if error.name not in (
+        "sglang.srt.kernel_plugins",
+        "sglang.srt.kernel_plugins.nvidia",
+        "sglang.srt.kernel_plugins.nvidia.binding",
+    ):
+        raise
+    from sglang.srt.megakernels.binding import HybridPoolView
 
 from .projection_storage import (
     coalesce_kda_projection_storage,
@@ -41,7 +51,7 @@ SGLANG_READS = {
     "srt/distributed/communication_op.py": ("tensor_model_parallel_all_reduce",),
     "srt/distributed/parallel_state.py": ("device_group",),
     "srt/arg_groups/fields/parallel.py": ("tp_group", "tp_rank", "tp_size"),
-    "srt/megakernels/binding.py": (
+    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "HybridPoolView",
         "cache",
         "capacity",
