@@ -314,7 +314,7 @@ class TestKimiK3RuntimeCompatibility(unittest.TestCase):
 
         def build(*args, **kwargs):
             events.append("build")
-            return object()
+            return SimpleNamespace(tokens_per_request=1)
 
         with (
             patch.object(

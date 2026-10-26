@@ -3,8 +3,9 @@
 """Cache-independent Kimi K3 megakernel resources and runtime-pool binding.
 
 SGLang's megakernel framework imports this module only after configuration and
-all-rank validation.  It prepares the frozen B1-B8/B16/B32/B64 TP8 provider set
-and later binds it to SGLang-owned typed cache views.
+all-rank validation. It prepares the frozen TP8 token-row provider set and later
+binds it to SGLang-owned typed cache views. Fixed-q4-8 verification borrows separate
+checkpoint pools; only stock DSpark commits them to persistent recurrent state.
 """
 
 from __future__ import annotations
@@ -41,10 +42,49 @@ from .projection_storage import (
     coalesce_kda_projection_storage,
     coalesce_mla_projection_storage,
 )
+from .shape_policy import MAX_ROWS, token_widths
 
 PAYLOAD_PACKAGE = "sgl_nvidia_mega.kimi_k3.cutedsl"
-_BATCHES = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
-_MAX_BATCH = max(_BATCHES)
+_MAX_BATCH = MAX_ROWS
+
+
+def _kda_policy(tokens_per_request: int) -> dict:
+    # Verify keys are (requests, q), unlike all row-wise projection/MoE policies.
+    widths = token_widths(tokens_per_request)
+    if tokens_per_request > 1:
+        return {
+            (rows // tokens_per_request, tokens_per_request): (6288, 1)
+            for rows in widths
+        }
+    return {
+        rows: (6288, 0 if rows in (16, 32, 64) else 1 if rows == 1 else 2)
+        for rows in widths
+    }
+
+
+def _projection_policies(pitch: int, widths: tuple[int, ...]) -> dict:
+    """Use the existing TP8 tactic at the next row bin, including odd q rows."""
+    if pitch not in (3648, 6288):
+        raise ValueError(f"unsupported Kimi K3 projection pitch: {pitch}")
+    policies = {}
+    for rows in widths:
+        if not 1 <= rows <= _MAX_BATCH:
+            raise ValueError(f"unsupported Kimi K3 projection rows: {rows}")
+        tile = next(size for size in (8, 16, 32, 64) if rows <= size)
+        if pitch == 6288:
+            tactic = (
+                (64, 64, 1, 6) if tile == 64 else (128, tile, 2, 5 if tile == 32 else 6)
+            )
+        else:
+            tactic = (
+                64,
+                tile,
+                4 if tile == 8 else 2,
+                {8: 8, 16: 10, 32: 8, 64: 5}[tile],
+            )
+        policies[rows] = tactic
+    return policies
+
 
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
@@ -56,6 +96,8 @@ SGLANG_READS = {
         "cache",
         "capacity",
         "conv",
+        "intermediate_conv_window",
+        "intermediate_ssm",
         "kda",
         "layer_mapping",
         "logical_dtype",
@@ -69,6 +111,7 @@ SGLANG_READS = {
         "temporal",
     ),
     "srt/runtime_context.py": ("get_parallel",),
+    "srt/models/kimi_k3.py": ("dspark_layers_to_capture",),
 }
 
 
@@ -414,6 +457,7 @@ class PreparedAttention:
     output: Any
     cache: torch.Tensor | None = None
     caches: tuple[torch.Tensor, torch.Tensor] | None = None
+    intermediates: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass
@@ -435,6 +479,8 @@ class ResourceSet:
     memory_before: dict[str, int]
     memory_after: dict[str, int]
     deadline_ns: int
+    tokens_per_request: int = 1
+    aux_capture_layers: tuple[int, ...] | None = None
     resource_inventory: list[dict[str, Any]] = field(default_factory=list)
     resource_digest: str = ""
     binding: dict[str, Any] | None = None
@@ -460,6 +506,44 @@ class ResourceSet:
     def refresh_inventory(self) -> None:
         self.resource_inventory = _owned_resource_inventory(self, self.model)
         self.resource_digest = _pointer_free_digest(self.resource_inventory)
+
+    def prepare_aux_capture(self) -> None:
+        """Compile the configured pre-norm mixture taps before graph capture.
+
+        SGLang configures target taps after build but before preparation. The
+        next consumer owns each tap's mixture weights; the final consumer owns
+        a last-layer tap. No per-forward auxiliary storage is allocated here.
+        """
+        if self.tokens_per_request == 1:
+            return
+        configured = self.model.model.dspark_layers_to_capture
+        if configured is None:
+            raise ValueError("Kimi K3 DSPARK auxiliary capture was not configured")
+        taps = tuple(int(layer_id) for layer_id in configured)
+        if (
+            not taps
+            or tuple(sorted(set(taps))) != taps
+            or any(layer_id < 0 or layer_id >= len(self.layers) for layer_id in taps)
+        ):
+            raise ValueError(f"invalid Kimi K3 DSPARK auxiliary capture layers: {taps}")
+        if self.aux_capture_layers is not None:
+            if taps != self.aux_capture_layers:
+                raise RuntimeError("Kimi K3 DSPARK auxiliary capture layers changed")
+            return
+        consumers = [
+            self.final
+            if layer_id == len(self.layers) - 1
+            else self.before[layer_id + 1]
+            for layer_id in taps
+        ]
+        if any(consumer is None for consumer in consumers):
+            raise ValueError("Kimi K3 DSPARK tap has no next consumer")
+        for layer_id, consumer in zip(taps, consumers):
+            consumer.bind_aux(mixture=True)
+            self.compilation_inventory.append(
+                {"kind": "attn_res_aux", "layer_id": layer_id, "name": "mixture"}
+            )
+        self.aux_capture_layers = taps
 
     def _binding_candidate(self, hybrid: HybridPoolView) -> dict[str, Any]:
         full_ids = [int(v) for v in self.model.config.full_attention_layer_ids]
@@ -591,6 +675,54 @@ class ResourceSet:
                     },
                 )
             )
+            if self.tokens_per_request > 1:
+                if len(state.intermediate_conv_window) != 1:
+                    raise ValueError(
+                        f"layer {layer_id} needs one KDA intermediate convolution window"
+                    )
+                windows = state.intermediate_conv_window[0]
+                checkpoints = state.intermediate_ssm
+                if not isinstance(windows, torch.Tensor) or windows.ndim != 4:
+                    raise ValueError(f"layer {layer_id} KDA windows must have rank 4")
+                capacity, queries = map(int, windows.shape[:2])
+                if capacity <= 0 or queries < self.tokens_per_request:
+                    raise ValueError(
+                        f"layer {layer_id} KDA scratch cannot hold q{self.tokens_per_request}"
+                    )
+                for name, tensor, dtype, shape, stride in (
+                    (
+                        "kda_intermediate_conv",
+                        windows,
+                        torch.bfloat16,
+                        (capacity, queries, 3, 4608),
+                        (queries * 3 * 4608, 3 * 4608, 4608, 1),
+                    ),
+                    (
+                        "kda_intermediate_ssm",
+                        checkpoints,
+                        torch.float32,
+                        (capacity, queries, 12, 128, 128),
+                        (queries * 12 * 128 * 128, 12 * 128 * 128, 128 * 128, 128, 1),
+                    ),
+                ):
+                    _validate_pool_tensor(
+                        f"layer {layer_id} {name}",
+                        tensor,
+                        dtype=dtype,
+                        shape=shape,
+                        stride=stride,
+                        device=device,
+                    )
+                    local_identities[f"{name}.{layer_id}"] = int(tensor.data_ptr())
+                    local_layouts.append(
+                        {
+                            "kind": name,
+                            "layer_id": layer_id,
+                            "shape": list(tensor.shape),
+                            "stride": list(tensor.stride()),
+                            "dtype": str(tensor.dtype),
+                        }
+                    )
 
         binding = {
             # The live serving capacity may shrink after graph capture. The
@@ -598,6 +730,8 @@ class ResourceSet:
             "kv_reserved_capacity": reserved_capacity,
             "kv_post_capture_active": bool(hybrid.mla.post_capture_active),
             "kda_capacity": kda_capacity,
+            "tokens_per_request": self.tokens_per_request,
+            "aux_capture_layers": list(self.aux_capture_layers or ()),
             "page_size": page_size,
             "logical_dtype": str(hybrid.mla.logical_dtype),
             "storage_dtype": str(hybrid.mla.storage_dtype),
@@ -615,6 +749,10 @@ class ResourceSet:
         return binding
 
     def bind(self, hybrid: HybridPoolView) -> None:
+        if self.tokens_per_request > 1 and self.aux_capture_layers is None:
+            raise RuntimeError(
+                "Kimi K3 DSPARK auxiliary taps must be prepared before binding"
+            )
         candidate = self._binding_candidate(hybrid)
         fingerprint = _digest(candidate)
         if self.binding_fingerprint is not None:
@@ -631,7 +769,15 @@ class ResourceSet:
             else:
                 state = hybrid.kda.state(layer_id)
                 caches = (state.conv[0], state.temporal)
-                provider.core.prepare_caches(caches)
+                if self.tokens_per_request > 1:
+                    intermediates = (
+                        state.intermediate_conv_window[0],
+                        state.intermediate_ssm,
+                    )
+                    provider.core.prepare_verify_caches(caches, intermediates)
+                    provider.intermediates = intermediates
+                else:
+                    provider.core.prepare_caches(caches)
                 provider.caches = caches
             self.compilation_inventory.append(
                 {"kind": "attention_core", "layer_id": layer_id, "name": provider.kind}
@@ -651,9 +797,11 @@ def build_resources(
     context_length: int,
     memory_before: dict[str, int],
     deadline_ns: int,
+    tokens_per_request: int = 1,
 ) -> ResourceSet:
-    """Build every frozen TP8/B1-B8/B16/B32/B64 provider after all-rank consensus."""
+    """Build this deployment's TP8 token-row providers after all-rank consensus."""
 
+    batches = token_widths(tokens_per_request)
     memory_before = dict(memory_before)
     origins: dict[str, str] = {}
     projection_module = _module("gemm.projection", origins)
@@ -712,7 +860,7 @@ def build_resources(
         "small_batch": small_box,
         "moe_tail": tail_box,
     }
-    moe_state = prepared_moe_module.MoEScratch(tp, device, _BATCHES)
+    moe_state = prepared_moe_module.MoEScratch(tp, device, batches)
     # Materialize the state-owned event handles before resource inventory.  The
     # prepared MoE records them again at each execution boundary, so completing
     # an initialization record on its own stream does not alter runtime order.
@@ -747,6 +895,25 @@ def build_resources(
         ),
         "moe": moe_state,
     }
+    if tokens_per_request > 1:
+        # Native graph padding uses physical KDA slots <= 0, but MLA requires
+        # zero lengths and negative write slots. Own the translated metadata
+        # before inventory/capture; never modify the framework's sealed views.
+        scratch.update(
+            {
+                "mla.verify_inactive": torch.empty(
+                    (_MAX_BATCH // tokens_per_request,), dtype=torch.bool, device=device
+                ),
+                "mla.verify_lengths": torch.empty(
+                    (_MAX_BATCH // tokens_per_request,),
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                "mla.verify_slots": torch.empty(
+                    (_MAX_BATCH,), dtype=torch.int64, device=device
+                ),
+            }
+        )
     # Explicitly own the side-stream/event lifecycle used by the future executor.
     # Recording the event materializes its CUDA handle without entering a model
     # forward path.
@@ -779,27 +946,16 @@ def build_resources(
                 )
             projection = projection_module.PreparedProjection(
                 projection_weight,
-                {
-                    batch: (
-                        (64, 64, 2, 5)
-                        if batch == 64
-                        else (64, 32, 2, 8)
-                        if batch == 32
-                        else (64, 16, 2, 10)
-                        if batch == 16
-                        else (64, 8, 4, 8)
-                    )
-                    for batch in _BATCHES
-                },
+                _projection_policies(3648, batches),
             ).prepare()
             core = mla_module.PreparedMla(
                 proxy,
-                {batch: 3648 for batch in _BATCHES},
+                {batch: 3648 for batch in batches},
                 scratch["mla.query"],
                 max_context=int(context_length),
                 core="trtllm",
                 dcp=None,
-                queries=(1,),
+                queries=(tokens_per_request,),
             )
             if not workspaces:
                 workspace, counter = _prepare_mla_workspace(
@@ -820,28 +976,11 @@ def build_resources(
                 )
             projection = projection_module.PreparedProjection(
                 projection_weight,
-                {
-                    batch: (
-                        (64, 64, 1, 6)
-                        if batch == 64
-                        else (128, 32, 2, 5)
-                        if batch == 32
-                        else (128, 16, 2, 6)
-                        if batch == 16
-                        else (128, 8, 2, 6)
-                    )
-                    for batch in _BATCHES
-                },
+                _projection_policies(6288, batches),
             ).prepare()
             core = kda_module.PreparedKda(
                 proxy,
-                {
-                    batch: (
-                        6288,
-                        0 if batch in (16, 32, 64) else 1 if batch == 1 else 2,
-                    )
-                    for batch in _BATCHES
-                },
+                _kda_policy(tokens_per_request),
                 False,
             )
             kind = "kda"
@@ -857,7 +996,7 @@ def build_resources(
         output = oproj_module.PreparedOproj(
             layer,
             mailbox,
-            _BATCHES,
+            batches,
             is_mla,
             front,
             oproj_twoshot,
@@ -876,7 +1015,7 @@ def build_resources(
         if not layer._is_moe_layer:
             feed_forward[layer_id] = dense_module.PreparedDenseMLP(
                 layer.mlp,
-                _BATCHES,
+                batches,
                 reduce=tensor_model_parallel_all_reduce,
             )
             compilation.append(
@@ -904,7 +1043,7 @@ def build_resources(
             op,
             layer.mlp.routed_expert_norm.weight,
             layer.mlp.routed_expert_up_proj.weight,
-            _BATCHES,
+            batches,
             (tail_box, ordinal, len(moe_layers)),
             deadline_ns=deadline_ns,
         )
@@ -928,12 +1067,12 @@ def build_resources(
             packed_front,
             front_box,
             moe_state.front,
-            _BATCHES,
+            batches,
             beta,
             linear_beta,
             plan=moe_state.plan,
             counters=moe_state.shared,
-            q=1,
+            q=tokens_per_request,
             deadline_ns=deadline_ns,
         )
         chain = chain_module.SmallBatchChain(
@@ -1018,6 +1157,7 @@ def build_resources(
         memory_before=memory_before,
         memory_after=_cuda_memory(),
         deadline_ns=deadline_ns,
+        tokens_per_request=tokens_per_request,
     )
     resources.refresh_inventory()
     return resources

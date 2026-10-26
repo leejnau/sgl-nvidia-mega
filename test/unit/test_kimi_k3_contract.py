@@ -61,8 +61,9 @@ NumericsKind = registry.NumericsKind
 MEGAKERNEL_API_VERSION = registry.MEGAKERNEL_API_VERSION
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
+# Includes the reviewed KDA and AttnRes adaptations documented beside each kernel.
 FROZEN_PAYLOAD_SHA256 = (
-    "317036ce5d069f1eb68ac110032d7a7f310ad78e2565fd605ed04e968c2aa82a"
+    "8d865537dbcc7b51a5614ae423956a2e710cddc65caf857ad0bcb58927d8f402"
 )
 
 
@@ -72,6 +73,9 @@ class _Mode:
 
     def is_decode(self) -> bool:
         return self.name == "decode"
+
+    def is_target_verify(self) -> bool:
+        return self.name == "target_verify"
 
 
 def _batch(mode: str, batch_size: int):
@@ -100,7 +104,10 @@ class TestKimiK3Contract(unittest.TestCase):
         self.assertEqual(SPEC.requires.resident_blocks, 152)
         self.assertEqual(SPEC.requires.dtypes, frozenset({"bfloat16"}))
         self.assertEqual(SPEC.requires.decode_graph_backends, frozenset({"full"}))
-        self.assertEqual(SPEC.features, frozenset({Feature.MULTI_NODE_TP}))
+        self.assertEqual(
+            SPEC.features,
+            frozenset({Feature.MULTI_NODE_TP, Feature.SPECULATIVE_DECODING}),
+        )
         self.assertEqual(SPEC.max_rows, 64)
         self.assertIsNotNone(SPEC.prepare)
         self.assertEqual(
@@ -170,7 +177,7 @@ class TestKimiK3Contract(unittest.TestCase):
             deadline_s=30.0,
             binding=object(),
         )
-        resources = object()
+        resources = SimpleNamespace(tokens_per_request=1)
         with (
             patch.object(
                 compat,
@@ -198,6 +205,7 @@ class TestKimiK3Contract(unittest.TestCase):
             context_length=8192,
             memory_before={},
             deadline_ns=30_000_000_000,
+            tokens_per_request=1,
         )
 
     def test_exact_widths_plan_and_every_other_call_falls_back(self):
@@ -205,6 +213,7 @@ class TestKimiK3Contract(unittest.TestCase):
 
         built = object.__new__(_Built)
         built.widths = WIDTHS
+        built.tokens_per_request = 1
         for width in WIDTHS:
             step = built.plan(SimpleNamespace(shape=(width,)), _batch("decode", width))
             self.assertEqual((step.mode, step.rows), ("decode", width))
@@ -238,6 +247,7 @@ class TestKimiK3Contract(unittest.TestCase):
         cfg = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend="full")),
             context_length=8192,
+            speculative_algorithm=None,
         )
         self.assertEqual(_config_disable_reasons(cfg, SimpleNamespace()), [])
         cfg.context_length = 4096
@@ -487,6 +497,8 @@ class TestKimiK3TypedStep(unittest.TestCase):
             )
         resources = SimpleNamespace(
             binding_fingerprint="bound",
+            tokens_per_request=1,
+            aux_capture_layers=None,
             model=SimpleNamespace(model=SimpleNamespace(embed_tokens=Mock())),
             layers=layers,
             attention=attention,
