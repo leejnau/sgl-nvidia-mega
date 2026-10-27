@@ -249,12 +249,13 @@ class TestKimiK3Contract(unittest.TestCase):
             context_length=8192,
             speculative_algorithm=None,
         )
-        self.assertEqual(_config_disable_reasons(cfg, SimpleNamespace()), [])
-        cfg.context_length = 4096
+        hf_config = SimpleNamespace(max_position_embeddings=1048576)
+        self.assertEqual(_config_disable_reasons(cfg, hf_config), [])
+        cfg.context_length = 262145
         cfg.cuda_graph_config.decode.backend = "disabled"
-        reasons = _config_disable_reasons(cfg, SimpleNamespace())
+        reasons = _config_disable_reasons(cfg, hf_config)
         self.assertTrue(any("FULL" in reason for reason in reasons))
-        self.assertTrue(any("8192" in reason for reason in reasons))
+        self.assertTrue(any("1..262144" in reason for reason in reasons))
 
         class PackedMXFP4Method:
             pass

@@ -61,7 +61,12 @@ from sgl_nvidia_mega.kimi_k3.executor import (
     _validate_step_inputs,
     _verify_mla_metadata,
 )
-from sgl_nvidia_mega.kimi_k3.shape_policy import VERIFY_QUERIES, token_widths
+from sgl_nvidia_mega.kimi_k3.shape_policy import (
+    MAX_CONTEXT,
+    VERIFY_QUERIES,
+    mla_max_seq_len,
+    token_widths,
+)
 
 
 def _resources(**overrides):
@@ -108,7 +113,8 @@ def test_fixed_dspark_only_configuration(q):
         speculative_num_draft_tokens=q,
         speculative_adaptive=False,
     )
-    assert spec._config_disable_reasons(cfg, None) == []
+    hf_config = SimpleNamespace(max_position_embeddings=1048576)
+    assert spec._config_disable_reasons(cfg, hf_config) == []
     assert Feature.RAGGED_VERIFY not in spec.SPEC.features
     assert Feature.CONTEXT_PARALLEL not in spec.SPEC.features
     assert spec.SPEC.requires.server_args["decode_attention_backend"] == {"trtllm_mla"}
@@ -116,13 +122,127 @@ def test_fixed_dspark_only_configuration(q):
         ("speculative_algorithm", "EAGLE", "requires DSPARK"),
         ("speculative_num_draft_tokens", 3, "fixed q4-8"),
         ("speculative_num_draft_tokens", 9, "fixed q4-8"),
+        ("speculative_num_draft_tokens", 6.0, "fixed q4-8"),
         ("speculative_adaptive", True, "adaptive"),
-        ("context_length", 16384, "8192"),
+        ("context_length", 262145, "1..262144"),
     ):
         changed = SimpleNamespace(**(vars(cfg) | {field: value}))
         assert any(
-            message in reason for reason in spec._config_disable_reasons(changed, None)
+            message in reason
+            for reason in spec._config_disable_reasons(changed, hf_config)
         )
+
+
+@pytest.mark.parametrize("q", (1, *VERIFY_QUERIES))
+@pytest.mark.parametrize(
+    "length", (1, 4096, 8192, 32768, 131072, 200000, 256000, 262144)
+)
+def test_context_range_and_verify_scheduling_hint(length, q):
+    cfg = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend="full")),
+        context_length=length,
+        speculative_algorithm=None if q == 1 else "DSPARK",
+        speculative_num_draft_tokens=q,
+        speculative_adaptive=False,
+    )
+    text = SimpleNamespace(max_position_embeddings=1048576)
+    # Both the native multimodal K3 config and its text config are accepted.
+    for hf_config in (text, SimpleNamespace(text_config=text)):
+        assert spec._config_disable_reasons(cfg, hf_config) == []
+    assert mla_max_seq_len(length, q) == length + (q if q > 1 else 0)
+    assert text.max_position_embeddings == 1048576
+
+
+@pytest.mark.parametrize(
+    "length", (None, True, False, 0, -1, 8192.0, "8192", 262145, 2**31)
+)
+def test_invalid_context_refuses_before_provider_construction(length):
+    cfg = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend="full")),
+        context_length=length,
+        speculative_algorithm=None,
+    )
+    assert any(
+        "1..262144" in reason
+        for reason in spec._config_disable_reasons(
+            cfg, SimpleNamespace(max_position_embeddings=1048576)
+        )
+    )
+    with (
+        patch.object(providers, "_module") as load_payload,
+        pytest.raises(ValueError, match="1..262144"),
+    ):
+        providers.build_resources(
+            None, context_length=length, memory_before={}, deadline_ns=1
+        )
+    load_payload.assert_not_called()
+
+
+def test_context_respects_native_model_cap_and_rope_policy_without_override():
+    cfg = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend="full")),
+        context_length=32768,
+        speculative_algorithm=None,
+    )
+    # Native context derivation, including scaling and original-window handling,
+    # is reused; the plugin never changes model metadata to admit a larger limit.
+    cases = (
+        (SimpleNamespace(max_position_embeddings=32768), True),
+        (SimpleNamespace(max_position_embeddings=32767), False),
+        (
+            SimpleNamespace(max_position_embeddings=8192, rope_scaling={"factor": 4}),
+            True,
+        ),
+        (
+            SimpleNamespace(
+                max_position_embeddings=8192,
+                rope_scaling={"factor": 4, "original_max_position_embeddings": 8192},
+            ),
+            False,
+        ),
+        (SimpleNamespace(), False),  # Native unspecified-model fallback is 2048.
+    )
+    for text, admitted in cases:
+        original = repr(vars(text))
+        reasons = spec._config_disable_reasons(cfg, SimpleNamespace(text_config=text))
+        assert (not reasons) is admitted
+        if not admitted:
+            assert any("exceeds native model limit" in reason for reason in reasons)
+        assert repr(vars(text)) == original
+    for q in (0, 2, 3, 9, True, 6.0):
+        with pytest.raises(ValueError, match="q1 decode or fixed q4-8"):
+            mla_max_seq_len(MAX_CONTEXT, q)
+
+
+def test_prepared_mla_uses_scheduling_hint_without_changing_backend_or_lengths():
+    tree = ast.parse(inspect.getsource(providers.build_resources))
+    hint = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "max_seq_len"
+            for target in node.targets
+        )
+    )
+    assert (
+        ast.unparse(hint.value) == "mla_max_seq_len(context_length, tokens_per_request)"
+    )
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "PreparedMla"
+    ]
+    assert len(calls) == 1
+    kwargs = {item.arg: ast.unparse(item.value) for item in calls[0].keywords}
+    assert kwargs == {
+        "max_context": "max_seq_len",
+        "core": "'trtllm'",
+        "dcp": "None",
+        "queries": "(tokens_per_request,)",
+    }
 
 
 def test_kda_verify_policy_uses_requests_and_preserves_decode_policy():
@@ -601,11 +721,16 @@ def _verify_metadata_scratch(device="cpu"):
 
 
 @pytest.mark.parametrize("q", VERIFY_QUERIES)
-def test_verify_mla_padding_uses_physical_slots_without_mutating_borrowed_metadata(q):
+@pytest.mark.parametrize("context_length", (8192, 32768, 131072, 262144))
+def test_verify_mla_padding_uses_physical_slots_without_mutating_borrowed_metadata(
+    q, context_length
+):
     """Native slot-zero padding must not race writes; scratch index zero is live."""
     scratch = _verify_metadata_scratch()
     pointers = {name: value.data_ptr() for name, value in scratch.items()}
-    lengths = torch.tensor([37, 68, 131, 5], dtype=torch.int32)
+    lengths = torch.tensor(
+        [context_length - q, context_length, context_length + q, 5], dtype=torch.int32
+    )
     slots = torch.arange(4 * q, dtype=torch.int64) + 2**40
     inputs = (lengths.clone(), slots.clone())
     for physical, expected_inactive in (
@@ -658,7 +783,8 @@ def test_verify_mla_metadata_graph_replays_startup_retirement_and_restoration(q)
     device = torch.device("cuda", torch.cuda.current_device())
     scratch = _verify_metadata_scratch(device)
     physical = torch.zeros(4, dtype=torch.int32, device=device)
-    lengths = torch.tensor([37, 68, 131, 5], dtype=torch.int32, device=device)
+    borrowed_lengths = [MAX_CONTEXT - q, MAX_CONTEXT, MAX_CONTEXT + q, 5]
+    lengths = torch.tensor(borrowed_lengths, dtype=torch.int32, device=device)
     slots = torch.arange(4 * q, dtype=torch.int64, device=device) + 2**40
     resources = _resources(
         model=torch.nn.Module(), scratch=scratch, tokens_per_request=q
@@ -681,9 +807,9 @@ def test_verify_mla_metadata_graph_replays_startup_retirement_and_restoration(q)
     pointers = (normalized_slots.data_ptr(), normalized_lengths.data_ptr())
     for indices, expected_lengths, inactive in (
         ([0, 0, 0, 0], [0, 0, 0, 0], (0, 1, 2, 3)),
-        ([7, 2, 3, 4], [37, 68, 131, 5], ()),
-        ([7, 2, 3, -1], [37, 68, 131, 0], (3,)),
-        ([7, 2, 3, 4], [37, 68, 131, 5], ()),
+        ([7, 2, 3, 4], borrowed_lengths, ()),
+        ([7, 2, 3, -1], borrowed_lengths[:3] + [0], (3,)),
+        ([7, 2, 3, 4], borrowed_lengths, ()),
     ):
         physical.copy_(torch.tensor(indices, dtype=torch.int32))
         graph.replay()
@@ -694,7 +820,7 @@ def test_verify_mla_metadata_graph_replays_startup_retirement_and_restoration(q)
         assert normalized_slots.cpu().tolist() == expected_slots
         assert normalized_lengths.cpu().tolist() == expected_lengths
         assert physical.cpu().tolist() == indices
-        assert lengths.cpu().tolist() == [37, 68, 131, 5]
+        assert lengths.cpu().tolist() == borrowed_lengths
         assert slots.cpu().tolist() == list(range(2**40, 2**40 + 4 * q))
         assert pointers == (normalized_slots.data_ptr(), normalized_lengths.data_ptr())
         assert (

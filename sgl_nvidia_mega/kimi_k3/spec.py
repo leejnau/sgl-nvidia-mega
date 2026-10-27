@@ -39,7 +39,7 @@ except ModuleNotFoundError as error:  # SGLang before sgl-project/sglang#45389
         Step,
     )
 
-from .shape_policy import DECODE_WIDTHS, VERIFY_QUERIES, token_widths
+from .shape_policy import DECODE_WIDTHS, VERIFY_QUERIES, mla_max_seq_len, token_widths
 
 if TYPE_CHECKING:
     try:
@@ -85,6 +85,8 @@ SGLANG_READS = {
         "aux_hidden_states",
     ),
     "srt/runtime_context.py": ("get_model",),
+    "srt/utils/hf_transformers/common.py": ("get_context_length",),
+    "srt/configs/kimi_k3.py": ("text_config",),
     "srt/arg_groups/fields/*.py": (
         "context_length",
         "cuda_graph_config",
@@ -135,17 +137,34 @@ def _deadline_ns(seconds: Any) -> int:
 
 
 def _config_disable_reasons(cfg: Any, hf_config: Any) -> list[str]:
+    from sglang.srt.utils.hf_transformers.common import get_context_length
+
     reasons: list[str] = []
     graph_config = cfg.cuda_graph_config
     if graph_config is None or graph_config.decode.backend != "full":
         reasons.append("needs the FULL decode CUDA-graph backend")
-    if int(cfg.context_length or 0) != 8192:
-        reasons.append("initial Kimi K3 coverage requires context length 8192")
+    try:
+        mla_max_seq_len(cfg.context_length, 1)
+    except ValueError as error:
+        reasons.append(str(error))
+    else:
+        # Use the native model limit, including its RoPE policy, without enabling
+        # the framework's opt-in longer-context override or modifying HF config.
+        text_config = getattr(hf_config, "text_config", hf_config)
+        model_limit = get_context_length(text_config)
+        if cfg.context_length > model_limit:
+            reasons.append(
+                f"context length {cfg.context_length} exceeds native model limit "
+                f"{model_limit}"
+            )
     algorithm = cfg.speculative_algorithm
     if algorithm is not None:
         if algorithm != "DSPARK":
             reasons.append("Kimi K3 speculative coverage requires DSPARK")
-        if cfg.speculative_num_draft_tokens not in VERIFY_QUERIES:
+        if (
+            type(cfg.speculative_num_draft_tokens) is not int
+            or cfg.speculative_num_draft_tokens not in VERIFY_QUERIES
+        ):
             reasons.append(
                 "Kimi K3 DSPARK coverage requires a fixed q4-8 verify window"
             )
@@ -295,7 +314,7 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
 
     resources = build_resources(
         model.language_model,
-        context_length=int(get_model().context_length),
+        context_length=get_model().context_length,
         memory_before=_cuda_memory(),
         deadline_ns=deadline_ns,
         tokens_per_request=context.tokens_per_request,

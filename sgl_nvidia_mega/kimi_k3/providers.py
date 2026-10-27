@@ -42,7 +42,7 @@ from .projection_storage import (
     coalesce_kda_projection_storage,
     coalesce_mla_projection_storage,
 )
-from .shape_policy import MAX_ROWS, token_widths
+from .shape_policy import MAX_ROWS, mla_max_seq_len, token_widths
 
 PAYLOAD_PACKAGE = "sgl_nvidia_mega.kimi_k3.cutedsl"
 _MAX_BATCH = MAX_ROWS
@@ -802,6 +802,7 @@ def build_resources(
     """Build this deployment's TP8 token-row providers after all-rank consensus."""
 
     batches = token_widths(tokens_per_request)
+    max_seq_len = mla_max_seq_len(context_length, tokens_per_request)
     memory_before = dict(memory_before)
     origins: dict[str, str] = {}
     projection_module = _module("gemm.projection", origins)
@@ -952,7 +953,7 @@ def build_resources(
                 proxy,
                 {batch: 3648 for batch in batches},
                 scratch["mla.query"],
-                max_context=int(context_length),
+                max_context=max_seq_len,
                 core="trtllm",
                 dcp=None,
                 queries=(tokens_per_request,),
