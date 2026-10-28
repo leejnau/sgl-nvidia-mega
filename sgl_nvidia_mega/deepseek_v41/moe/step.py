@@ -19,6 +19,8 @@ import logging
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import sglang_ops
+
 logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
@@ -63,7 +65,7 @@ SGLANG_READS = {
         "moe_runner_config",
     ),
     "srt/layers/moe/utils.py": ("sum_post_experts_output",),
-    "srt/layers/layer_boundary/fusions/moe_finalize.py": (
+    "srt/layers/layer_boundary/fusions/moe_finalize.py|srt/layers/layer_boundary/fusions/cutedsl.py": (
         "MoeDeferredFinalize",
         "from_flashinfer",
     ),
@@ -324,12 +326,9 @@ def _dual_stream(
     current.wait_stream(mlp.alt_stream)
 
     if deferred and fwd.defer_moe_finalize:
-        from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
-            MoeDeferredFinalize,
-        )
         from sglang.srt.layers.moe.utils import sum_post_experts_output
 
-        return MoeDeferredFinalize.from_flashinfer(
+        return sglang_ops.moe_deferred_finalize_from_flashinfer(
             routed,
             gated_shared_output=shared,
             m=x.shape[0],
