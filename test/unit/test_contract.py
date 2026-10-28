@@ -10,7 +10,8 @@ fails here, naming the file to repair, instead of failing at a GPU server's star
 A module whose stock step mirrors an SGLang function lists it in ``SGLANG_MIRRORS``
 with the digest of its code, so a changed branch fails here too. A file that moved
 between SGLang versions is named newest first, ``"new.py|old.py"``; the first one
-present is checked. The checks are static (AST and tokens): no package module is
+present is checked. A read name such as "replication|layout" accepts either field.
+The checks are static (AST and tokens): no package module is
 imported. Run them against every supported SGLang and nightly against main.
 """
 
@@ -114,7 +115,11 @@ def test_sglang_provides_what_the_plugin_reads(path):
         files = _files(pattern)
         assert files, f"{_id(path)}: no file matches {pattern}"
         provided = frozenset().union(*map(_provided, files))
-        missing += [f"{pattern}: {n}" for n in names if n not in provided]
+        missing += [
+            f"{pattern}: {n}"
+            for n in names
+            if not any(alternative in provided for alternative in n.split("|"))
+        ]
     assert not missing, (
         f"SGLang no longer provides what {_id(path)} reads; repair it and its "
         "SGLANG_READS:\n  " + "\n  ".join(missing)
