@@ -90,15 +90,15 @@ class TestKimiK3Contract(unittest.TestCase):
         registry_patch.start()
         self.addCleanup(registry_patch.stop)
 
-    def test_spec_is_exact_api1_tp8_sm103_surface(self):
+    def test_spec_is_exact_api2_tp8_sm103_surface(self):
         from sgl_nvidia_mega.kimi_k3.spec import (
             REQUIRED_MEGAKERNEL_API_VERSION,
             SPEC,
         )
 
-        self.assertEqual(REQUIRED_MEGAKERNEL_API_VERSION, 1)
-        self.assertEqual(SPEC.api_version, 1)
-        self.assertEqual(MEGAKERNEL_API_VERSION, 1)
+        self.assertEqual(REQUIRED_MEGAKERNEL_API_VERSION, 2)
+        self.assertEqual(SPEC.api_version, 2)
+        self.assertEqual(MEGAKERNEL_API_VERSION, 2)
         self.assertEqual(SPEC.requires.isas, frozenset({"sm_103"}))
         self.assertEqual(SPEC.requires.tp_sizes, frozenset({8}))
         self.assertEqual(SPEC.requires.resident_blocks, 152)
@@ -158,13 +158,39 @@ class TestKimiK3Contract(unittest.TestCase):
                 for name in sys.modules
             )
         )
-        with patch.object(registry, "MEGAKERNEL_API_VERSION", 2):
-            incompatible, reason = registry.find_spec(
-                architectures=["KimiK3ForConditionalGeneration"], isa="sm_103"
+        for version in (1, 3):
+            with (
+                self.subTest(version=version),
+                patch.object(registry, "MEGAKERNEL_API_VERSION", version),
+            ):
+                incompatible, reason = registry.find_spec(
+                    architectures=["KimiK3ForConditionalGeneration"], isa="sm_103"
+                )
+                self.assertIsNone(incompatible)
+                self.assertIn("uses megakernel API version 2", reason)
+                self.assertIn(f"requires version {version}", reason)
+
+    def test_api2_optional_entries_keep_stock_draft_and_graph_paths(self):
+        from sglang.srt.kernel_plugins.nvidia import binding
+
+        from sgl_nvidia_mega.kimi_k3.spec import _Built
+
+        built = object.__new__(_Built)
+        model = SimpleNamespace(
+            _megakernel=binding._InstalledMegakernel(
+                built=built, binding=None, prepare=None
             )
-        self.assertIsNone(incompatible)
-        self.assertIn("uses megakernel API version 1", reason)
-        self.assertIn("requires version 2", reason)
+        )
+        self.assertEqual(binding._offered_entries(built), ())
+        self.assertEqual(binding._offered_graph_variants(built), {})
+        for name in registry.ENTRIES:
+            with self.subTest(entry=name):
+                self.assertIsNone(binding.megakernel_entry(model, name))
+        for runner in registry.GRAPH_VARIANT_RUNNERS:
+            with self.subTest(runner=runner):
+                self.assertIsNone(
+                    binding.megakernel_graph_variants(model, runner, batch_sizes=(1, 4))
+                )
 
     def test_build_filters_the_dense_capture_range_to_frozen_widths(self):
         from sgl_nvidia_mega.kimi_k3 import compat, providers
