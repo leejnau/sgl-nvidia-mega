@@ -169,8 +169,12 @@ def matched(tmp_path_factory):
         assert "B300" in prop.name and "GB300" not in prop.name, prop.name
         assert (prop.major, prop.minor, prop.multi_processor_count) == (10, 3, 148)
         hardware.append({"name": prop.name, "sms": prop.multi_processor_count})
-    output = Path(
-        os.environ.get("KIMI_CI_OUTPUT_DIR") or tmp_path_factory.mktemp("kimi-ci")
+    output = (
+        Path(
+            os.environ.get("MEGA_E2E_OUTPUT_DIR")
+            or tmp_path_factory.mktemp("megakernel-e2e")
+        )
+        / "kimi_k3"
     )
     output.mkdir(parents=True, exist_ok=True)
     revisions = {
