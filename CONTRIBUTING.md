@@ -103,8 +103,10 @@ one parallel layout does not qualify another layout.
 When introducing a model or hardware combination, list its E2E test files in
 [`test/e2e/ci_models.yaml`](test/e2e/ci_models.yaml) with the GPU and the number
 of GPUs on one host they need. SGLang's workflow reads that file from the PR's
-checkout and runs every model its runner can hold; it logs each model it skips
-and the reason, so no SGLang change is needed. A test file that exists but is not
+checkout and selects from SGLang's reviewed runner mappings. Adding a new GPU
+runner mapping requires a SGLang workflow change; adding a model that fits an
+existing mapping does not. Unavailable configurations are logged, and explicitly
+requesting one fails. A test file that exists but is not
 listed there is not CI coverage. Required cases must execute: report a missing
 runner, model or unsupported setup as unavailable coverage, not a successful
 qualification.
@@ -192,17 +194,22 @@ GPU runner capacity must also be available.
 The SGLang workflow introduced in
 [SGLang #49642](https://github.com/sgl-project/sglang/pull/49642) runs on four
 GB300 GPUs. Since [SGLang #50641](https://github.com/sgl-project/sglang/pull/50641)
-it selects from `test/e2e/ci_models.yaml`. Today that selects
-DeepSeek-V4.1-Flash:
+it selects from `test/e2e/ci_models.yaml`. The per-model runner extension retains
+the four-GB300 mapping for DeepSeek-V4.1-Flash and adds eight B300 GPUs for Kimi K3:
 
 - `test/e2e/test_deepseek_v41_server.py`: serving accuracy.
 - `test/e2e/test_deepseek_v41_switch.py`: eager stock-path numerical parity.
+- `test/e2e/test_kimi_k3_b300.py`: separate matched accuracy and performance
+  entry points sharing one sequential stock/plugin pair. TP8, five-proposal/q6
+  DSpark, stock draft execution, DCP off, and the existing `sm148` opt-in.
+  This entry requires the companion SGLang runner-selection change; listing it
+  does not establish B300 qualification before its GPU run passes.
 
 Qwen3.5 is listed but skipped: its tests need TP8, eight GB300 GPUs on one host.
 
-These are not yet an accuracy/performance pair. The initial accuracy test uses
+The DeepSeek tests are not yet an accuracy/performance pair. The initial accuracy test uses
 an absolute bound; it still needs conversion to the matched-baseline protocol.
-A performance E2E entry point and workflow coverage for other supported
+Performance E2E and workflow coverage for the remaining supported
 model/hardware combinations remain to be added. The existing
 [benchmark tools](benchmark/README.md) can supply measurement helpers, but are
 not automatically an E2E CI gate. Mega's cross-repository trigger is introduced
