@@ -17,6 +17,7 @@ import os
 import re
 import statistics
 import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +45,11 @@ COMMON_ARGS = [
     "64",
     "--attention-backend",
     "trtllm_mla",
+    # Admission checks the phase fields directly, not their inherited backend.
+    "--prefill-attention-backend",
+    "trtllm_mla",
+    "--decode-attention-backend",
+    "trtllm_mla",
     "--moe-runner-backend",
     "flashinfer_mxfp4",
     "--mem-fraction-static",
@@ -70,6 +76,30 @@ COMMON_ARGS = [
     "--watchdog-timeout",
     "600",
 ]
+
+
+def _check_admission(args, output):
+    """Resolve the real plugin launch configuration before either weight load."""
+    with (output / "admission.log").open("w") as log:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; from sglang.srt.plugins import load_plugins; "
+                "from sglang.srt.server_args import prepare_server_args; "
+                "load_plugins(); prepare_server_args(sys.argv[1:]).resolve_once(); "
+                "print('KIMI_B300_ADMISSION=PASS', flush=True)",
+                "--model-path",
+                MODEL,
+                *args,
+                "--enable-nvidia-megakernel",
+            ],
+            env={**os.environ, SLOTS: "sm148"},
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=180,
+            check=True,
+        )
 
 
 def _request(endpoint, payload=None):
@@ -252,6 +282,7 @@ def matched(tmp_path_factory):
             indent=2,
         )
     )
+    _check_admission(args, output)
     results = {}
     for arm in ("stock", "plugin"):
         enabled = arm == "plugin"
@@ -273,6 +304,8 @@ def matched(tmp_path_factory):
                 info = _request("/server_info")
                 assert info["enable_nvidia_megakernel"] == enabled
                 assert info["speculative_dspark_block_size"] == 5
+                assert info["prefill_attention_backend"] == "trtllm_mla"
+                assert info["decode_attention_backend"] == "trtllm_mla"
                 (directory / "server-info.json").write_text(json.dumps(info, indent=2))
                 probes = []
                 # Warm capture, cross into eager B3/B4, retire requests, return to B1.
