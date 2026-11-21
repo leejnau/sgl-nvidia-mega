@@ -2,6 +2,10 @@
 # gpu and gpus: the GPU and how many of them on one host the model's tests need.
 # SGLang selects a reviewed runner for each GPU/count requirement. Models without
 # a suitable runner are not covered; explicitly requesting one must fail.
+#
+# Each model's key is its CI label: run-ci-sglang:<key> on a PR runs only that
+# model, and run-ci-sglang runs them all. Keys use lowercase letters, digits and
+# underscores. sync-ci-labels.yml creates the label once the entry is on main.
 
 deepseek_v41:
   gpu: GB300
@@ -9,13 +13,6 @@ deepseek_v41:
   tests:
     - test_deepseek_v41_server.py
     - test_deepseek_v41_switch.py
-
-# TP8: needs a host with eight GPUs; one GB300 tray has four
-qwen3_5:
-  gpu: GB300
-  gpus: 8
-  tests:
-    - test_qwen3_5_stock_parity.py
 
 # Requires SGLang's per-model runner selection; stock draft execution, q6, DCP off.
 kimi_k3:
